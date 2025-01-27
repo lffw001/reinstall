@@ -1,6 +1,17 @@
 @echo off
 mode con cp select=437 >nul
 
+rem 还原 setup.exe
+rename X:\setup.exe.disabled setup.exe
+
+rem 等待 10 秒才自动安装
+cls
+for /l %%i in (10,-1,1) do (
+    echo Press Ctrl+C within %%i seconds to cancel the automatic installation.
+    call :sleep 1000
+    cls
+)
+
 rem win7 find 命令在 65001 代码页下有问题，仅限 win 7
 rem findstr 就正常，但安装程序又没有 findstr
 rem echo a | find "a"
@@ -32,6 +43,16 @@ echo list vol | diskpart | find "efi" && (
     set BootType=bios
 )
 
+rem 获取 ProductType
+for /f "tokens=3" %%a in ('reg query "HKLM\SYSTEM\CurrentControlSet\Control\ProductOptions" /v ProductType') do (
+    set "ProductType=%%a"
+)
+
+rem 获取 BuildNumber
+for /f "tokens=3" %%a in ('reg query "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion" /v CurrentBuildNumber') do (
+    set "BuildNumber=%%a"
+)
+
 rem 获取 installer 卷 id
 for /f "tokens=2" %%a in ('echo list vol ^| diskpart ^| find "installer"') do (
     set "VolIndex=%%a"
@@ -50,7 +71,7 @@ rem wmic pagefile
 
 rem 获取主硬盘 id
 rem vista pe 没有 wmic，因此用 diskpart
-(echo select vol %VolIndex% & echo list disk) | diskpart | find "* " > X:\disk.txt
+(echo select vol %VolIndex% & echo list disk) | diskpart | find "* Disk " > X:\disk.txt
 for /f "tokens=3" %%a in (X:\disk.txt) do (
     set "DiskIndex=%%a"
 )
@@ -74,11 +95,16 @@ rem 重新分区/格式化
 
     echo create part primary
     echo format fs=ntfs quick
+    rem echo assign letter=Z
 ) else (
     echo select disk %DiskIndex%
 
     echo select part 1
+    rem echo delete part override
+    rem echo create part primary
     echo format fs=ntfs quick
+    echo active
+    rem echo assign letter=Z
 )) > X:\diskpart.txt
 
 rem 使用 diskpart /s ，出错不会执行剩下的 diskpart 命令
@@ -88,9 +114,18 @@ del X:\diskpart.txt
 rem 盘符
 rem X boot.wim (ram)
 rem Y installer
+rem Z os
 
-rem 设置 autounattend.xml 的主硬盘 id
-set "file=X:\autounattend.xml"
+rem 旧版安装程序会自动在C盘设置虚拟内存，新版安装程序(24h2)不会
+rem 如果不创建虚拟内存，1g 内存的机器安装时会报错/杀进程
+if %BuildNumber% GEQ 26040 (
+    rem 已经在 installer 分区创建了虚拟内存，约等于 boot.wim 的大小，因此这步不需要
+    rem vista/2008 没有删除 boot.wim，200M预留空间-(文件系统占用+驱动占用)后，实测能创建1个64M虚拟内存文件
+    rem call :createPageFileOnZ
+)
+
+rem 设置应答文件的主硬盘 id
+set "file=X:\windows.xml"
 set "tempFile=X:\tmp.xml"
 
 set "search=%%disk_id%%"
@@ -106,7 +141,6 @@ set "replace=%DiskIndex%"
 )) > %tempFile%
 move /y %tempFile% %file%
 
-rename X:\setup.exe.disabled setup.exe
 
 rem https://github.com/pbatard/rufus/issues/1990
 for %%a in (RAM TPM SecureBoot) do (
@@ -114,40 +148,57 @@ for %%a in (RAM TPM SecureBoot) do (
 )
 
 rem 设置
-set EnableEMS=0
-set ForceOldSetup=1
-
-if %EnableEMS% EQU 1 (
-    set EMS=/EMSPort:COM1 /EMSBaudRate:115200
-)
+set ForceOldSetup=0
+set EnableUnattended=1
 
 rem 运行 ramdisk X:\setup.exe 的话
 rem vista 会找不到安装源
 rem server 23h2 会无法运行
-
-rem 26040 开始有新版安装程序
-rem 新版安装程序不会创建 BIOS MBR 引导
-if %ForceOldSetup% EQU 1 (
+if "%ForceOldSetup%"=="1" (
     set setup=Y:\sources\setup.exe
 ) else (
     set setup=Y:\setup.exe
-    rem 旧版安装程序不会创建 winre 分区
-    rem 新版安装程序会创建 winre 分区
-    rem winre 分区创建在 installer 分区前面
-    rem 禁止 winre 分区后，winre 储存在 C 盘，依然有效
-    for /f "tokens=3" %%a in ('reg query "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion" /v CurrentBuildNumber') do (
-        if %%a GEQ 26040 (
-            set ResizeRecoveryPartition=/ResizeRecoveryPartition Disable
-        )
-    )
 )
 
-%setup% %ResizeRecoveryPartition% %EMS%
+if "%EnableUnattended%"=="1" (
+    set Unattended=/unattend:X:\windows.xml
+)
+
+rem 新版安装程序默认开了 Compact OS
+
+rem 新版安装程序不会创建 BIOS MBR 引导
+rem 因此要回退到旧版，或者手动修复 MBR
+rem server 2025 + bios 也是
+rem 但是 server 2025 官网写支持 bios
+rem TODO: 使用 ms-sys 可以不修复？
+if %BuildNumber% GEQ 26040 if "%BootType%"=="bios" (
+    rem set ForceOldSetup=1
+    bootrec /fixmbr
+)
+
+rem 旧版安装程序不会创建 winre 分区
+rem 新版安装程序会创建 winre 分区
+rem winre 分区创建在 installer 分区前面
+rem 禁止 winre 分区后，winre 储存在 C 盘，依然有效
+if %BuildNumber% GEQ 26040 if "%ForceOldSetup%"=="0" (
+    set ResizeRecoveryPartition=/ResizeRecoveryPartition Disable
+)
+
+rem 为 windows server 打开 EMS
+rem 普通 windows 没有自带 EMS 组件，暂不处理
+if "%ProductType%"=="ServerNT" (
+    rem set EMS=/EMSPort:UseBIOSSettings /EMSBaudRate:115200
+    set EMS=/EMSPort:COM1 /EMSBaudRate:115200
+)
+
+echo on
+%setup% %ResizeRecoveryPartition% %EMS% %Unattended%
 exit /b
 
 :sleep
-rem 没有 timeout 命令
 rem 没有加载网卡驱动，无法用 ping 来等待
+rem 没有 timeout 命令
+rem timeout /t 10 /nobreak
 echo wscript.sleep(%~1) > X:\sleep.vbs
 cscript //nologo X:\sleep.vbs
 del X:\sleep.vbs
@@ -155,10 +206,11 @@ exit /b
 
 :createPageFile
 rem 尽量填满空间，pagefile 默认 64M
-for /l %%i in (1, 1, 10) do (
-    wpeutil CreatePageFile /path=Y:\pagefile%%i.sys 2>nul
-    if errorlevel 1 (
-        exit /b
-    )
+for /l %%i in (1, 1, 100) do (
+    wpeutil CreatePageFile /path=Y:\pagefile%%i.sys >nul 2>nul && echo Created pagefile%%i.sys || exit /b
 )
+exit /b
+
+:createPageFileOnZ
+wpeutil CreatePageFile /path=Z:\pagefile.sys /size=512
 exit /b
